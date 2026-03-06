@@ -14,6 +14,7 @@ const (
 	SchemeLocal     ProviderScheme = "local"
 	SchemeOllama    ProviderScheme = "ollama"
 	SchemeOpenAI    ProviderScheme = "openai"
+	SchemeLocalAI   ProviderScheme = "localai"
 	SchemeAnthropic ProviderScheme = "anthropic"
 	SchemeVoyage    ProviderScheme = "voyage"
 	SchemeCohere    ProviderScheme = "cohere"
@@ -34,6 +35,7 @@ type ProviderConfig struct {
 // ParseProviderURL parses a provider URL and returns a ProviderConfig.
 // Supports:
 //   - ollama://host:port/model
+//   - localai://host:port/model
 //   - openai://model
 //   - anthropic://model
 //   - voyage://model
@@ -65,7 +67,7 @@ func ParseProviderURL(raw string) (*ProviderConfig, error) {
 		}
 		config.Model = model
 		return config, nil
-	case SchemeOllama:
+	case SchemeOllama, SchemeLocalAI:
 		return parseOllamaURL(parsed, config)
 	case SchemeOpenAI:
 		return parseOpenAIURL(parsed, config)

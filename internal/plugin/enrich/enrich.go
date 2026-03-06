@@ -52,7 +52,7 @@ func NewEnrichService(providerURL string) (*EnrichService, error) {
 	switch provCfg.Scheme {
 	case plugin.SchemeOllama:
 		prov = NewOllamaLLMProvider()
-	case plugin.SchemeOpenAI:
+	case plugin.SchemeOpenAI, plugin.SchemeLocalAI:
 		prov = NewOpenAILLMProvider()
 	case plugin.SchemeAnthropic:
 		prov = NewAnthropicLLMProvider()
