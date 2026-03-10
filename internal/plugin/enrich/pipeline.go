@@ -2,13 +2,20 @@ package enrich
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/scrypster/muninndb/internal/config"
 	"github.com/scrypster/muninndb/internal/plugin"
 	"github.com/scrypster/muninndb/internal/storage"
 )
+
+// ErrNothingToEnrich is returned when all pipeline stages are skipped because
+// the engram already has inline data (e.g., Summary set by caller during Write).
+// This is distinct from a real failure where LLM/network errors caused stages to fail.
+var ErrNothingToEnrich = errors.New("enrich: nothing to enrich")
 
 // EnrichmentPipeline orchestrates the LLM calls per engram.
 // In full mode (default) it runs up to 4 calls: entity extraction,
@@ -51,8 +58,8 @@ func (p *EnrichmentPipeline) stageEnabled(stage string) bool {
 // Run executes the enrichment pipeline for one engram.
 // The engram's existing fields are checked: if a stage's output is already
 // present (caller-provided via inline enrichment), that stage is skipped.
-// Returns nil, nil if all calls fail (graceful degradation).
-// Returns error only if the entire pipeline is completely unavailable.
+// Returns an error if every enabled stage either fails or produces no output.
+// Partial failures are logged per-stage and still return any successful output.
 func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (result *plugin.EnrichmentResult, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -62,6 +69,7 @@ func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (resu
 	}()
 
 	result = &plugin.EnrichmentResult{}
+	var stageErrors []string
 
 	// Call 1: Entity extraction
 	var entities []plugin.ExtractedEntity
@@ -69,6 +77,7 @@ func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (resu
 		ents, err := p.extractEntities(ctx, eng)
 		if err != nil {
 			slog.Warn("enrich: entity extraction failed", "id", eng.ID.String(), "err", err)
+			stageErrors = append(stageErrors, fmt.Sprintf("entities: %v", err))
 			ents = nil
 		}
 		entities = ents
@@ -80,6 +89,7 @@ func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (resu
 		rels, err := p.extractRelationships(ctx, eng, entities)
 		if err != nil {
 			slog.Warn("enrich: relationship extraction failed", "id", eng.ID.String(), "err", err)
+			stageErrors = append(stageErrors, fmt.Sprintf("relationships: %v", err))
 			rels = nil
 		}
 		result.Relationships = rels
@@ -90,10 +100,11 @@ func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (resu
 		memType, typeLabel, category, subcategory, tags, err := p.classify(ctx, eng)
 		if err != nil {
 			slog.Warn("enrich: classification failed", "id", eng.ID.String(), "err", err)
+			stageErrors = append(stageErrors, fmt.Sprintf("classification: %v", err))
 		} else {
-			mt, typeStr := resolveClassification(memType, typeLabel)
-			result.MemoryType = typeStr
-			_ = mt
+			mt, _ := resolveClassification(memType, typeLabel)
+			result.MemoryType = mt.String()
+			result.TypeLabel = typeLabel
 			if category != "" && subcategory != "" {
 				result.Classification = category + "/" + subcategory
 			}
@@ -106,6 +117,7 @@ func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (resu
 		summary, keyPoints, err := p.summarize(ctx, eng)
 		if err != nil {
 			slog.Warn("enrich: summarization failed", "id", eng.ID.String(), "err", err)
+			stageErrors = append(stageErrors, fmt.Sprintf("summary: %v", err))
 		} else {
 			result.Summary = summary
 			result.KeyPoints = keyPoints
@@ -113,9 +125,13 @@ func (p *EnrichmentPipeline) Run(ctx context.Context, eng *storage.Engram) (resu
 	}
 
 	// If ALL stages produced nothing, return error so retry can be attempted
-	if result.Summary == "" && len(result.Entities) == 0 &&
-		result.MemoryType == "" && result.Classification == "" {
-		return nil, fmt.Errorf("enrich: all pipeline stages failed for engram %s", eng.ID.String())
+	if result.Summary == "" && len(result.KeyPoints) == 0 &&
+		len(result.Entities) == 0 && result.MemoryType == "" &&
+		result.TypeLabel == "" && result.Classification == "" {
+		if len(stageErrors) > 0 {
+			return nil, fmt.Errorf("enrich: all pipeline stages failed for engram %s: %s", eng.ID.String(), strings.Join(stageErrors, "; "))
+		}
+		return nil, fmt.Errorf("engram %s: %w", eng.ID.String(), ErrNothingToEnrich)
 	}
 
 	return result, nil

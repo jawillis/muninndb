@@ -2,10 +2,14 @@ package plugin
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"runtime"
 	"sync"
 	"time"
+
+	"github.com/cockroachdb/pebble"
 )
 
 // pollInterval is how often the processor checks for newly written, unembedded engrams.
@@ -15,10 +19,6 @@ const pollInterval = 3 * time.Second
 // This bounds iterator lifetime during bulk imports and keeps the hot path
 // responsive; any remaining unprocessed engrams are picked up on the next tick.
 const maxBatchSize = 1000
-
-// embedMicroBatch is the number of engrams embedded in one ORT inference call.
-// Matches localMaxBatch in the embed package so the provider runs at full batch.
-const embedMicroBatch = 32
 
 // maxBackoff is the upper bound for exponential back-off when the store
 // returns persistent errors on CountWithoutFlag / ScanWithoutFlag.
@@ -96,6 +96,15 @@ func (rp *RetroactiveProcessor) Mode() string {
 	return "enrich"
 }
 
+// skipFlags returns the digest flags that should be excluded from scanning.
+// Embed processors skip DigestEmbedFailed engrams to avoid infinite retry loops.
+func (rp *RetroactiveProcessor) skipFlags() uint8 {
+	if rp.flagBit == DigestEmbed {
+		return DigestEmbedFailed
+	}
+	return 0
+}
+
 func (rp *RetroactiveProcessor) run(ctx context.Context) {
 	defer rp.wg.Done()
 
@@ -168,11 +177,12 @@ func (rp *RetroactiveProcessor) backoff(ctx context.Context, consecutiveErrors i
 // in one pass. Returns true on success (including zero-work passes), false if
 // a store-level error prevents processing (used by run() for backoff decisions).
 //
-// For EmbedPlugin: accumulates embedMicroBatch engrams and issues one ORT
+// For EmbedPlugin: accumulates up to MaxBatchSize() engrams and issues one
 // inference call per micro-batch, then scatters vectors back individually.
 // For EnrichPlugin: processes one engram at a time (LLM call per engram).
 func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
-	total, err := rp.store.CountWithoutFlag(ctx, rp.flagBit)
+	skipFlags := rp.skipFlags()
+	total, err := rp.store.CountWithoutFlag(ctx, rp.flagBit, skipFlags)
 	if err != nil {
 		slog.Error("retroactive processor: count failed", "plugin", rp.plugin.Name(), "error", err)
 		return false
@@ -188,7 +198,7 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 	rp.stats.Total += total
 	rp.statsMu.Unlock()
 
-	iter := rp.store.ScanWithoutFlag(ctx, rp.flagBit)
+	iter := rp.store.ScanWithoutFlag(ctx, rp.flagBit, skipFlags)
 	if iter == nil {
 		slog.Error("retroactive processor: failed to create iterator", "plugin", rp.plugin.Name())
 		return false
@@ -199,9 +209,15 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 	batchCount := 0
 
 	// For embed plugins, accumulate a micro-batch and embed in one ORT call.
+	// The batch size is determined by the plugin's MaxBatchSize() so the provider
+	// runs at its optimal throughput rather than a hardcoded constant.
 	embedPlugin, isEmbedPlugin := rp.plugin.(EmbedPlugin)
-	microEngrams := make([]*Engram, 0, embedMicroBatch)
-	microTexts := make([]string, 0, embedMicroBatch)
+	microBatchSize := 32 // fallback for the non-embed path (never used there)
+	if isEmbedPlugin {
+		microBatchSize = embedPlugin.MaxBatchSize()
+	}
+	microEngrams := make([]*Engram, 0, microBatchSize)
+	microTexts := make([]string, 0, microBatchSize)
 
 	flushMicroBatch := func() {
 		if !isEmbedPlugin || len(microEngrams) == 0 {
@@ -209,10 +225,24 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 		}
 		vecs, embedErr := embedPlugin.Embed(ctx, microTexts)
 		if embedErr != nil {
+			ids := make([]string, len(microEngrams))
+			for i, e := range microEngrams {
+				ids[i] = e.ID.String()
+			}
 			slog.Warn("retroactive processor: embed batch failed",
 				"plugin", rp.plugin.Name(),
 				"batch_size", len(microEngrams),
+				"engram_ids", ids,
 				"error", embedErr)
+			// Mark each engram with DigestEmbedFailed so the processor does not
+			// retry them indefinitely. If the underlying provider recovers, an
+			// operator can clear the flag manually or via the admin API.
+			for _, e := range microEngrams {
+				if flagErr := rp.store.SetDigestFlag(ctx, e.ID, DigestEmbedFailed); flagErr != nil {
+					slog.Warn("retroactive processor: failed to set DigestEmbedFailed",
+						"plugin", rp.plugin.Name(), "engram_id", e.ID.String(), "error", flagErr)
+				}
+			}
 			rp.statsMu.Lock()
 			rp.stats.Errors += int64(len(microEngrams))
 			rp.statsMu.Unlock()
@@ -301,7 +331,7 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 			microEngrams = append(microEngrams, eng)
 			microTexts = append(microTexts, eng.Concept+" "+eng.Content)
 			batchCount++
-			if len(microEngrams) >= embedMicroBatch {
+			if len(microEngrams) >= microBatchSize {
 				flushMicroBatch()
 			}
 			if batchCount%100 == 0 {
@@ -416,8 +446,12 @@ func (rp *RetroactiveProcessor) processEngram(ctx context.Context, eng *Engram) 
 		// conflated summarization keypoints with entity extraction. Flags are authoritative.
 		flags, err := rp.store.GetDigestFlags(ctx, eng.ID)
 		if err != nil {
-			slog.Warn("enrich: failed to read digest flags, skipping engram", "id", eng.ID.String(), "err", err)
-			return nil
+			if errors.Is(err, pebble.ErrNotFound) {
+				flags = 0
+			} else {
+				slog.Warn("enrich: failed to read digest flags, skipping engram", "id", eng.ID.String(), "err", err)
+				return nil
+			}
 		}
 		hasSummary := eng.Summary != "" || (flags&DigestSummarized != 0)
 		hasEntities := flags&DigestEntities != 0
@@ -434,6 +468,9 @@ func (rp *RetroactiveProcessor) processEngram(ctx context.Context, eng *Engram) 
 		if err != nil {
 			return err
 		}
+		if result == nil {
+			return fmt.Errorf("enrich returned nil result")
+		}
 
 		// Only overwrite fields the caller didn't provide.
 		// hasSummary covers both eng.Summary != "" and DigestSummarized flag;
@@ -445,45 +482,15 @@ func (rp *RetroactiveProcessor) processEngram(ctx context.Context, eng *Engram) 
 			}
 		}
 
-		// Store the enrichment result
-		if err := rp.store.UpdateDigest(ctx, eng.ID, result); err != nil {
+		if hasEntities {
+			result.Entities = nil
+		}
+		if hasRelationships {
+			result.Relationships = nil
+		}
+
+		if err := PersistEnrichmentResult(ctx, rp.store, eng.ID, result); err != nil {
 			return err
-		}
-
-		// Upsert entities (only if caller didn't provide them)
-		if !hasEntities {
-			var linkedEntityNames []string
-			for _, entity := range result.Entities {
-				if err := rp.store.UpsertEntity(ctx, entity); err != nil {
-					slog.Warn("enrich: failed to upsert entity", "id", eng.ID.String(), "name", entity.Name, "err", err)
-					continue
-				}
-				if err := rp.store.LinkEngramToEntity(ctx, eng.ID, entity.Name); err != nil {
-					slog.Warn("enrich: failed to link engram to entity", "id", eng.ID.String(), "name", entity.Name, "err", err)
-					continue
-				}
-				linkedEntityNames = append(linkedEntityNames, entity.Name)
-			}
-			// Write co-occurrence pairs for entities co-appearing in this engram.
-			for i := 0; i < len(linkedEntityNames); i++ {
-				for j := i + 1; j < len(linkedEntityNames); j++ {
-					_ = rp.store.IncrementEntityCoOccurrence(ctx, eng.ID, linkedEntityNames[i], linkedEntityNames[j])
-				}
-			}
-		}
-
-		// Mark entity extraction complete so subsequent polls skip this stage.
-		if !hasEntities && len(result.Entities) > 0 {
-			if err := rp.store.SetDigestFlag(ctx, eng.ID, DigestEntities); err != nil {
-				slog.Warn("enrich: failed to set DigestEntities flag", "id", eng.ID.String(), "err", err)
-			}
-		}
-
-		// Upsert relationships
-		for _, rel := range result.Relationships {
-			if err := rp.store.UpsertRelationship(ctx, eng.ID, rel); err != nil {
-				slog.Warn("failed to upsert relationship", "error", err)
-			}
 		}
 
 		return nil

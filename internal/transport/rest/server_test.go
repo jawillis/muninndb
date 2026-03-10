@@ -155,7 +155,7 @@ func (m *MockEngine) Unsubscribe(ctx context.Context, subID string) error {
 	return nil
 }
 
-func (m *MockEngine) ClearVault(ctx context.Context, vaultName string) error { return nil }
+func (m *MockEngine) ClearVault(ctx context.Context, vaultName string) error  { return nil }
 func (m *MockEngine) DeleteVault(ctx context.Context, vaultName string) error { return nil }
 func (m *MockEngine) RenameVault(ctx context.Context, oldName, newName string) error {
 	return nil
@@ -284,6 +284,10 @@ func (m *MockEngine) Observability(ctx context.Context, version string, uptimeSe
 
 func (m *MockEngine) GetProcessorStats() []plugin.RetroactiveStats {
 	return nil
+}
+
+func (m *MockEngine) ExportGraph(ctx context.Context, vault string, includeEngrams bool) (*engine.ExportGraph, error) {
+	return &engine.ExportGraph{}, nil
 }
 
 // backupMockEngine embeds MockEngine but creates a real Pebble checkpoint so
@@ -1782,6 +1786,41 @@ func TestGetEngram_HappyPath(t *testing.T) {
 	}
 }
 
+type readFactEngine struct{ MockEngine }
+
+func (e *readFactEngine) Read(ctx context.Context, req *ReadRequest) (*ReadResponse, error) {
+	return &ReadResponse{
+		ID:         "fact-id",
+		Concept:    "fact",
+		Content:    "fact content",
+		Confidence: 0.9,
+		MemoryType: 0,
+		TypeLabel:  "deployment_configuration",
+	}, nil
+}
+
+func TestGetEngram_IncludesZeroMemoryType(t *testing.T) {
+	server := NewServer("localhost:8080", &readFactEngine{}, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
+
+	req := httptest.NewRequest("GET", "/api/engrams/fact-id?vault=default", nil)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got, ok := resp["memory_type"]; !ok {
+		t.Fatal("expected memory_type field to be present")
+	} else if got != float64(0) {
+		t.Fatalf("memory_type = %v, want 0", got)
+	}
+}
+
 // readErrEngine returns an error from Read so the handler falls through to 404.
 type readErrEngine struct{ MockEngine }
 
@@ -1953,7 +1992,7 @@ func TestGuide_EngineError(t *testing.T) {
 // returns correct MCP URL for the UI to call entity graph via MCP.
 func TestEntityGraphVisualization_MCPInfoEndpoint(t *testing.T) {
 	// Create server with MCP address configured
-	server := NewServer("localhost:8080", &MockEngine{}, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil, MCPInfo{Addr: "localhost:8750", HasToken: false})
+	server := NewServer("localhost:8080", &MockEngine{}, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil, MCPInfo{Addr: "127.0.0.1:8750", HasToken: false})
 
 	req := httptest.NewRequest("GET", "/api/admin/mcp-info", nil)
 	w := httptest.NewRecorder()

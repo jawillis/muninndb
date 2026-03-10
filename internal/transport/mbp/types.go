@@ -124,7 +124,7 @@ type ReadResponse struct {
 	LastAccess     int64    `msgpack:"last_access"           json:"last_access"`
 	Summary        string   `msgpack:"summary,omitempty"     json:"summary,omitempty"`
 	KeyPoints      []string `msgpack:"key_points,omitempty"  json:"key_points,omitempty"`
-	MemoryType     uint8    `msgpack:"memory_type,omitempty" json:"memory_type,omitempty"`
+	MemoryType     uint8    `msgpack:"memory_type" json:"memory_type"`
 	TypeLabel      string   `msgpack:"type_label,omitempty"  json:"type_label,omitempty"`
 	Classification uint16   `msgpack:"classification,omitempty" json:"classification,omitempty"`
 	// EmbedDim is the stored embedding dimensionality code (0 = no embedding).
@@ -143,10 +143,10 @@ type ActivateRequest struct {
 	Filters     []Filter  `msgpack:"filters,omitempty" json:"filters,omitempty"`
 	Vault       string    `msgpack:"vault,omitempty" json:"vault,omitempty"`
 	Embedding   []float32 `msgpack:"embedding,omitempty" json:"embedding,omitempty"`
-	BriefMode   string    `msgpack:"brief_mode,omitempty" json:"brief_mode,omitempty"`                       // "extractive"|"llm"|"auto"|"" (default: "auto")
-	DisableHops bool      `msgpack:"disable_hops,omitempty" json:"disable_hops,omitempty"`                   // when true, override default hop traversal to 0
-	Profile     string    `json:"profile,omitempty" msgpack:"profile,omitempty"`                             // traversal profile override: ""|"default"|"causal"|"confirmatory"|"adversarial"|"structural"
-	Mode        string    `json:"mode,omitempty" msgpack:"mode,omitempty"`                                   // recall mode preset: "semantic"|"recent"|"balanced"|"deep"
+	BriefMode   string    `msgpack:"brief_mode,omitempty" json:"brief_mode,omitempty"`     // "extractive"|"llm"|"auto"|"" (default: "auto")
+	DisableHops bool      `msgpack:"disable_hops,omitempty" json:"disable_hops,omitempty"` // when true, override default hop traversal to 0
+	Profile     string    `json:"profile,omitempty" msgpack:"profile,omitempty"`           // traversal profile override: ""|"default"|"causal"|"confirmatory"|"adversarial"|"structural"
+	Mode        string    `json:"mode,omitempty" msgpack:"mode,omitempty"`                 // recall mode preset: "semantic"|"recent"|"balanced"|"deep"
 }
 
 // Weights defines scoring weight distribution.
@@ -166,9 +166,9 @@ type Weights struct {
 	CGDNPower float32 `msgpack:"cgdn_power,omitempty" json:"cgdn_power,omitempty"` // divisive normalization power (default 2.0)
 	// ACT-R: total recall mode. Score = ContentMatch × softplus(B(M) + scale×Hebbian).
 	UseACTR      bool    `msgpack:"use_actr,omitempty" json:"use_actr,omitempty"`
-	ACTRDecay    float32 `msgpack:"actr_decay,omitempty" json:"actr_decay,omitempty"`           // power-law exponent d (default 0.5)
-	ACTRHebScale float32 `msgpack:"actr_heb_scale,omitempty" json:"actr_heb_scale,omitempty"`   // Hebbian amplifier (default 4.0)
-	DisableACTR  bool    `msgpack:"disable_actr,omitempty" json:"disable_actr,omitempty"`       // when true, use legacy weighted-sum scoring instead of ACT-R
+	ACTRDecay    float32 `msgpack:"actr_decay,omitempty" json:"actr_decay,omitempty"`         // power-law exponent d (default 0.5)
+	ACTRHebScale float32 `msgpack:"actr_heb_scale,omitempty" json:"actr_heb_scale,omitempty"` // Hebbian amplifier (default 4.0)
+	DisableACTR  bool    `msgpack:"disable_actr,omitempty" json:"disable_actr,omitempty"`     // when true, use legacy weighted-sum scoring instead of ACT-R
 }
 
 // Filter restricts activation results.
@@ -201,12 +201,14 @@ type ActivationItem struct {
 	ID              string          `msgpack:"id"                          json:"id"`
 	Concept         string          `msgpack:"concept"                     json:"concept"`
 	Content         string          `msgpack:"content"                     json:"content"`
+	Summary         string          `msgpack:"summary,omitempty"           json:"summary,omitempty"`
 	Score           float32         `msgpack:"score"                       json:"score"`
 	Confidence      float32         `msgpack:"confidence"                  json:"confidence"`
 	ScoreComponents ScoreComponents `msgpack:"score_components,omitempty"  json:"score_components,omitempty"`
 	Why             string          `msgpack:"why,omitempty"               json:"why,omitempty"`
 	HopPath         []string        `msgpack:"hop_path,omitempty"          json:"hop_path,omitempty"`
 	Dormant         bool            `msgpack:"dormant,omitempty"           json:"dormant,omitempty"`
+	CreatedAt       int64           `msgpack:"created_at,omitempty"        json:"created_at,omitempty"`
 	LastAccess      int64           `msgpack:"last_access,omitempty"       json:"last_access,omitempty"`
 	AccessCount     uint32          `msgpack:"access_count,omitempty"      json:"access_count,omitempty"`
 	Relevance       float32         `msgpack:"relevance,omitempty"         json:"relevance,omitempty"`
